@@ -50,6 +50,15 @@ def _easyocr_reader() -> Any:
             "easyocr is not installed — run: py -3.12 -m pip install easyocr"
         ) from exc
     # First call downloads the detection + recognition models (~100-150 MB).
+    # Some networks/PCs fail SSL verification for that download
+    # (CERTIFICATE_VERIFY_FAILED) — bypass verification for the model
+    # download only. These are public ML weights, not sensitive data.
+    try:
+        import ssl as _ssl
+
+        _ssl._create_default_https_context = _ssl._create_unverified_context
+    except Exception:
+        pass
     return easyocr.Reader(["ch_sim", "en"], gpu=False)
 
 
