@@ -204,7 +204,7 @@ def _detect_frame(
 def _track_boxes(
     boxes_by_time: list[tuple[float, list[dict[str, float]]]],
     interval_s: float,
-    max_gap_s: float = 12.0,
+    max_gap_s: float = 20.0,
     min_dur_s: float = 1.0,
     match_iou: float = 0.20,
     bridge_iou: float = 0.10,
@@ -235,21 +235,30 @@ def _track_boxes(
                                "ss": b.get("ss", False)})
             # else: weak box with no nearby track — likely noise, drop it
     # Bridge gaps: same text zone that blinked for a few seconds.
+    # Every earlier track is a merge candidate (not just the previous one):
+    # different text elements (subtitles + side name cards) often interleave
+    # in time, so the matching track may not be the immediate predecessor.
     tracks.sort(key=lambda tr: tr["t0"])
     merged = True
     while merged:
         merged = False
         out: list[dict[str, Any]] = []
         for tr in tracks:
-            if out:
-                prev = out[-1]
+            best = None
+            best_iou = 0.0
+            for prev in out:
                 gap = tr["t0"] - prev["t1"]
-                if 0 <= gap <= max_gap_s and _iou(prev["box"], tr["box"]) >= bridge_iou:
-                    prev["box"] = _union(prev["box"], tr["box"])
-                    prev["t1"] = tr["t1"]
-                    merged = True
-                    continue
-            out.append(tr)
+                if 0 <= gap <= max_gap_s:
+                    iou = _iou(prev["box"], tr["box"])
+                    if iou >= bridge_iou and iou > best_iou:
+                        best, best_iou = prev, iou
+            if best is not None:
+                best["box"] = _union(best["box"], tr["box"])
+                best["t1"] = tr["t1"]
+                best["ss"] = best.get("ss", False) or tr.get("ss", False)
+                merged = True
+            else:
+                out.append(tr)
         tracks = out
     # Strong-shape tracks (big titles, vertical text) survive even from a
     # single frame — brief name cards appear for ~2s and must not be lost.
@@ -287,7 +296,7 @@ def detect_cjk_boxes(
     interval_s: float = 2.0,
     min_conf: float = 0.25,
     sample_width: int = 960,
-    max_gap_s: float = 12.0,
+    max_gap_s: float = 20.0,
     min_dur_s: float = 1.0,
     max_boxes: int = 80,
     should_stop: Callable[[], bool] | None = None,

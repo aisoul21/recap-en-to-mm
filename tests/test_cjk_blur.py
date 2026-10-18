@@ -118,6 +118,31 @@ class TestTrackBoxes(unittest.TestCase):
         tracks = _track_boxes(seq, 2.0, max_gap_s=8.0)
         self.assertEqual(len(tracks), 2)
 
+    def test_interleaved_zones_bridge_correctly(self):
+        # Subtitle band blinks; a side name-card appears in between.
+        # The two subtitle tracks must still bridge across the name card,
+        # and the name card must stay its own track.
+        sub = lambda: _b(0.25, 0.81, 0.5, 0.12)   # bottom subtitle band
+        card = lambda: _b(0.79, 0.08, 0.12, 0.37)  # right-side name card
+        seq = [
+            (0.0, [sub()]),
+            (2.0, [sub()]),
+            (4.0, [card()]),          # name card interleaves
+            (6.0, [card()]),
+            (10.0, [sub()]),         # subtitle returns after a gap
+            (12.0, [sub()]),
+        ]
+        tracks = _track_boxes(seq, 2.0, max_gap_s=20.0)
+        self.assertEqual(len(tracks), 2)
+        subs = [t for t in tracks if t["box"]["y"] > 0.5]
+        cards = [t for t in tracks if t["box"]["y"] < 0.5]
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(subs[0]["t0"], 0.0)
+        self.assertEqual(subs[0]["t1"], 12.0)
+        self.assertEqual(cards[0]["t0"], 4.0)
+        self.assertEqual(cards[0]["t1"], 6.0)
+
     def test_single_frame_dropped_as_noise(self):
         seq = [(0.0, []), (2.0, [_b(0.5, 0.5, 0.2, 0.1)]), (4.0, [])]
         tracks = _track_boxes(seq, 2.0, min_dur_s=1.0)
