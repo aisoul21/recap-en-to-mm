@@ -101,6 +101,7 @@ def _union(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
     for k in ("text", "conf"):
         if k in a or k in b:
             out[k] = a.get(k, b.get(k))
+    out["lc"] = bool(a.get("lc", False) and b.get("lc", False))
     return out
 
 
@@ -139,6 +140,9 @@ def _merge_boxes(
     return list(groups.values())
 
 
+LOW_CONF = 0.01  # boxes this weak may extend a track, never start one
+
+
 def _detect_frame(
     reader: Any,
     img_path: Path,
@@ -146,14 +150,21 @@ def _detect_frame(
     img_h: int,
     min_conf: float,
 ) -> list[dict[str, float]]:
-    """OCR one frame → merged CJK boxes in normalized (0..1) coordinates."""
+    """OCR one frame → merged CJK boxes in normalized (0..1) coordinates.
+
+    Boxes with min_conf > conf >= LOW_CONF are kept but flagged ("lc");
+    they may extend an existing track, never start a new one. This catches
+    correctly-located subtitle boxes whose recognition failed.
+    """
     boxes: list[dict[str, float]] = []
     for bbox, text, conf in reader.readtext(str(img_path)):
         try:
             conf_f = float(conf)
         except (TypeError, ValueError):
             continue
-        if conf_f < min_conf or not has_cjk(text):
+        if not has_cjk(text):
+            continue
+        if conf_f < min_conf and conf_f < LOW_CONF:
             continue
         xs = [float(p[0]) for p in bbox]
         ys = [float(p[1]) for p in bbox]
@@ -165,7 +176,8 @@ def _detect_frame(
             continue
         boxes.append(
             {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
-             "text": str(text), "conf": round(conf_f, 3)}
+             "text": str(text), "conf": round(conf_f, 3),
+             "lc": conf_f < min_conf}
         )
     return _merge_boxes(boxes)
 
@@ -173,10 +185,10 @@ def _detect_frame(
 def _track_boxes(
     boxes_by_time: list[tuple[float, list[dict[str, float]]]],
     interval_s: float,
-    max_gap_s: float = 8.0,
+    max_gap_s: float = 12.0,
     min_dur_s: float = 1.0,
     match_iou: float = 0.20,
-    bridge_iou: float = 0.25,
+    bridge_iou: float = 0.10,
 ) -> list[dict[str, Any]]:
     """Link per-frame boxes into tracks {box, t0, t1}; bridge short gaps."""
     tracks: list[dict[str, Any]] = []
@@ -187,14 +199,20 @@ def _track_boxes(
             for tr in tracks:
                 if t - tr["t1"] > interval_s * 2.0 + 0.5:
                     continue  # too old to be the same text
-                iou = _iou(b, tr["box"])
+                # Match against the most recent box, not the whole-track
+                # union: a short subtitle line still matches the previous
+                # short line even after the union grew wide.
+                iou = _iou(b, tr["last"])
                 if iou > best_iou:
                     best, best_iou = tr, iou
             if best is not None and best_iou >= match_iou:
                 best["box"] = _union(best["box"], b)
+                best["last"] = dict(b)
                 best["t1"] = t
-            else:
-                tracks.append({"box": dict(b), "t0": t, "t1": t})
+            elif not b.get("lc"):
+                tracks.append({"box": dict(b), "last": dict(b),
+                               "t0": t, "t1": t})
+            # else: weak box with no nearby track — likely noise, drop it
     # Bridge gaps: same text zone that blinked for a few seconds.
     tracks.sort(key=lambda tr: tr["t0"])
     merged = True
@@ -243,9 +261,9 @@ def detect_cjk_boxes(
     *,
     log: LogFn = _noop,
     interval_s: float = 2.0,
-    min_conf: float = 0.35,
+    min_conf: float = 0.25,
     sample_width: int = 960,
-    max_gap_s: float = 8.0,
+    max_gap_s: float = 12.0,
     min_dur_s: float = 1.0,
     max_boxes: int = 80,
     should_stop: Callable[[], bool] | None = None,

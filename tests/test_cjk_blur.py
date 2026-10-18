@@ -81,9 +81,13 @@ class TestDetectFrame(unittest.TestCase):
             ],
         })
         boxes = _detect_frame(reader, Path("frm_00001.jpg"), 960, 540, 0.35)
-        self.assertEqual(len(boxes), 1)
-        self.assertEqual(boxes[0]["text"], "中文字幕")
-        self.assertAlmostEqual(boxes[0]["x"], 10 / 960, places=4)
+        # high-conf CJK kept as normal; weak CJK kept flagged (extends only)
+        self.assertEqual(len(boxes), 2)
+        by_text = {b["text"]: b for b in boxes}
+        self.assertFalse(by_text["中文字幕"]["lc"])
+        self.assertTrue(by_text["你好"]["lc"])
+        # merge pads boxes by 0.008
+        self.assertAlmostEqual(by_text["中文字幕"]["x"], 10 / 960 - 0.008, places=4)
 
 
 class TestTrackBoxes(unittest.TestCase):
@@ -165,3 +169,46 @@ class TestIou(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestLowConfExtension(unittest.TestCase):
+    def test_weak_box_extends_track(self):
+        seq = [
+            (0.0, [_b(0.2, 0.2, 0.3, 0.1, conf=0.9, lc=False)]),
+            (2.0, [_b(0.2, 0.2, 0.3, 0.1, conf=0.9, lc=False)]),
+            # weak box (bad recognition) at the same spot extends the track
+            (4.0, [_b(0.21, 0.21, 0.28, 0.09, conf=0.08, lc=True)]),
+        ]
+        tracks = _track_boxes(seq, 2.0, min_dur_s=1.0)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["t1"], 4.0)
+
+    def test_weak_box_alone_starts_nothing(self):
+        seq = [
+            (0.0, []),
+            (2.0, [_b(0.5, 0.5, 0.2, 0.1, conf=0.08, lc=True)]),
+            (4.0, []),
+        ]
+        tracks = _track_boxes(seq, 2.0, min_dur_s=1.0)
+        self.assertEqual(tracks, [])
+
+    def test_merged_high_plus_weak_can_start_track(self):
+        from cjk_blur import _merge_boxes
+        merged = _merge_boxes([
+            _b(0.20, 0.20, 0.10, 0.05, conf=0.9, lc=False),
+            _b(0.22, 0.20, 0.10, 0.05, conf=0.08, lc=True),
+        ])
+        self.assertEqual(len(merged), 1)
+        self.assertFalse(merged[0]["lc"])
+
+class TestLastBoxMatching(unittest.TestCase):
+    def test_short_line_matches_previous_short_line(self):
+        # union grows wide from an early long line; later short lines must
+        # still match via the most recent box, not the wide union.
+        seq = [
+            (0.0, [_b(0.20, 0.80, 0.60, 0.10, conf=0.9)]),   # long line
+            (2.0, [_b(0.40, 0.80, 0.10, 0.10, conf=0.9)]),   # short line
+            (4.0, [_b(0.41, 0.80, 0.10, 0.10, conf=0.9)]),   # short line again
+        ]
+        tracks = _track_boxes(seq, 2.0, min_dur_s=1.0)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["t1"], 4.0)
