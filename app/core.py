@@ -854,6 +854,26 @@ def _encoder_args(encoder: str) -> list[str]:
     return ["-c:v", "libx264", "-preset", "medium", "-crf", "18"]
 
 
+def _blur_enable_expr(box: dict[str, Any]) -> str:
+    """ffmpeg overlay enable expression for time-ranged blur boxes.
+
+    Boxes may carry optional ``t0``/``t1`` (seconds on the output timeline,
+    produced by cjk_blur.detect_cjk_boxes). Without them the box applies to
+    the whole video (legacy behaviour for hand-drawn boxes).
+    """
+    t0 = box.get("t0")
+    t1 = box.get("t1")
+    if t0 is None or t1 is None:
+        return ""
+    try:
+        a, b = float(t0), float(t1)
+    except (TypeError, ValueError):
+        return ""
+    if not b > a:
+        return ""
+    return f":enable='between(t,{a:.3f},{b:.3f})'"
+
+
 def apply_production_overlays(
     ffmpeg: str,
     input_video: Path,
@@ -930,7 +950,7 @@ def apply_production_overlays(
             f"boxblur=luma_radius={blur_strength}:luma_power=2:"
             f"chroma_radius={chroma_blur_strength}:chroma_power=1[{blur}]"
         )
-        graph.append(f"[{base}][{blur}]overlay={x}:{y}[{out}]")
+        graph.append(f"[{base}][{blur}]overlay={x}:{y}{_blur_enable_expr(b)}[{out}]")
         current = f"[{out}]"
 
     if title_idx is not None and title_file is not None:
@@ -1371,11 +1391,41 @@ class EdgeSmartSync:
         concat_video_parts(self.ffmpeg, video_parts, paths.synced_video_noaudio, paths.work)
         self._log_sync_check(paths, segments, checkpoint)
         video_for_mux = paths.synced_video_noaudio
-        if self.overlays.get("blur_boxes") or str(self.overlays.get("title_text") or "").strip() or str(self.overlays.get("logo_path") or "").strip() or str(self.overlays.get("extra_text") or "").strip():
+        overlays = self.overlays
+        if overlays.get("auto_cjk_blur"):
+            # Chinese text auto-blur (cjk_blur.py): detect on the FINAL synced
+            # video so t0/t1 are already on the output timeline.
+            self.log("🔍 Chinese text auto-detect (OCR) on the final video…")
+            try:
+                from cjk_blur import detect_cjk_boxes
+                auto_boxes = detect_cjk_boxes(
+                    self.ffmpeg,
+                    paths.synced_video_noaudio,
+                    paths.work,
+                    log=self.log,
+                    interval_s=float(overlays.get("auto_cjk_interval_s", 2.0)),
+                    min_conf=float(overlays.get("auto_cjk_min_conf", 0.35)),
+                    should_stop=self.should_stop,
+                )
+                (self.job_dir / "cjk_boxes.json").write_text(
+                    json.dumps(auto_boxes, ensure_ascii=False, indent=1),
+                    encoding="utf-8",
+                )
+                if auto_boxes:
+                    overlays = dict(overlays)
+                    overlays["blur_boxes"] = [
+                        dict(b) for b in (overlays.get("blur_boxes") or [])
+                    ] + auto_boxes
+                    self.log(f"🔍 Auto-blur: {len(auto_boxes)} Chinese-text zone(s)")
+                else:
+                    self.log("🔍 Auto-blur: no Chinese text found")
+            except Exception as exc:  # OCR is optional — never break the render
+                self.log(f"⚠️ Chinese auto-blur skipped: {exc}")
+        if overlays.get("blur_boxes") or str(overlays.get("title_text") or "").strip() or str(overlays.get("logo_path") or "").strip() or str(overlays.get("extra_text") or "").strip():
             self.log("🎨 Production overlay pass — Blur / Title PNG / Logo...")
             video_for_mux = apply_production_overlays(
                 self.ffmpeg, paths.synced_video_noaudio, paths.decorated_video_noaudio,
-                self.overlays, encoder, paths.work, self.log, frame_size=(layout["cw"], layout["ch"]),
+                overlays, encoder, paths.work, self.log, frame_size=(layout["cw"], layout["ch"]),
             )
         self.log("🎧 Edge TTS audio mux...")
         volume_percent = int(getattr(self, "voice_volume_percent", 100) or 100)

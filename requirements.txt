@@ -17,3 +17,8 @@ numpy==2.2.6                # Short pauses + audio helpers
 pillow==12.3.0              # overlays, preview
 requests==2.32.3
 playwright==1.62.0          # Myanmar text renderer (Chromium)
+
+# --- Optional: Chinese text auto-blur (OCR), added 2026-10-18 ---
+# Install ONLY if you tick "Auto-blur Chinese text (OCR)" in the app:
+#   py -3.12 -m pip install easyocr
+# easyocr

@@ -186,6 +186,7 @@ class App(tk.Tk):
         self.preview_time = tk.DoubleVar(value=float(self.cfg.get("preview_seek_seconds", 1.0)))
         self.preview_duration = 0.0
         self.blur_boxes: list[dict[str, float]] = []
+        self.auto_cjk_blur = tk.BooleanVar(value=bool(self.cfg.get("auto_cjk_blur", False)))
         self.selected_blur: int | None = None
         self.title_pos = list(self.cfg.get("title_position", [0.50, 0.12]))
         self.logo_pos = list(self.cfg.get("logo_position", [0.80, 0.06]))
@@ -453,6 +454,9 @@ class App(tk.Tk):
         ttk.Button(blur_row, text="Delete Selected", style="Compact.TButton", command=self._delete_selected_blur).pack(side="left", padx=6)
         self.blur_count_label = ttk.Label(blur_row, text="0 box", style="Muted.TLabel")
         self.blur_count_label.pack(side="left", padx=(4, 0))
+        ttk.Checkbutton(blur_row, text="Auto-blur Chinese text (OCR)",
+                        variable=self.auto_cjk_blur,
+                        command=self._cjk_changed).pack(side="left", padx=(12, 0))
 
         section(6, "Title")
         self.title_entry = ttk.Entry(tools, textvariable=self.title_text, font=("Myanmar Text", 10))
@@ -593,6 +597,13 @@ class App(tk.Tk):
         percent = int(round(float(value) / 5.0) * 5)  # 5% steps
         self.voice_volume.set(percent)
         self.voice_volume_label.configure(text=f"{percent}% ({20 * math.log10(percent / 100.0):+.1f}dB)")
+
+    def _cjk_changed(self) -> None:
+        # Persist right away so the choice survives a restart even before START.
+        self.cfg["auto_cjk_blur"] = bool(self.auto_cjk_blur.get())
+        save_config(self.cfg)
+        self._log(f"🔍 Chinese auto-blur (OCR) {'ON' if self.auto_cjk_blur.get() else 'OFF'}"
+                  f" — needs: py -3.12 -m pip install easyocr")
 
     def _mirror_changed(self) -> None:
         # Persist right away so the choice survives a restart even before START.
@@ -1110,6 +1121,7 @@ class App(tk.Tk):
         overlays = {
             "blur_boxes": [dict(x) for x in self.blur_boxes],
             "blur_strength": int(self.cfg.get("overlay_blur_strength", 18)),
+            "auto_cjk_blur": bool(self.auto_cjk_blur.get()),
             "title_text": self.title_text.get().strip(),
             "title_position": [float(self.title_pos[0]), float(self.title_pos[1])],
             "title_font_size": int(self.title_size.get()),
