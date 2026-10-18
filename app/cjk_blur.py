@@ -153,6 +153,23 @@ def _merge_boxes(
 LOW_CONF = 0.01  # boxes this weak may extend a track, never start one
 
 
+def _load_pixels(img_path: Path) -> tuple[Any, int, int]:
+    """Load an image as an RGB numpy array; returns (pixels, w, h).
+
+    Uses PIL — never cv2.imread — because OpenCV returns None for
+    non-ASCII paths on Windows (e.g. a job folder named after a Chinese
+    video). EasyOCR's internal cv2.imread() hit exactly that and crashed
+    with "'NoneType' object has no attribute 'shape'", which skipped the
+    entire blur pass for the video.
+    """
+    from PIL import Image
+    import numpy as np
+
+    with Image.open(img_path) as im:
+        rgb = im.convert("RGB")
+        return np.array(rgb), rgb.width, rgb.height
+
+
 def _detect_frame(
     reader: Any,
     img_path: Path,
@@ -167,8 +184,24 @@ def _detect_frame(
     Weak boxes (conf < min_conf) without a strong shape are flagged ("lc"):
     they may extend an existing nearby track but never start a new one.
     """
+    pixels, _, _ = _load_pixels(img_path)
+    return _detect_pixels(reader, pixels, img_w, img_h, min_conf)
+
+
+def _detect_pixels(
+    reader: Any,
+    pixels: Any,
+    img_w: int,
+    img_h: int,
+    min_conf: float,
+) -> list[dict[str, float]]:
+    """Same as _detect_frame but takes image pixels (numpy array).
+
+    EasyOCR receives the array directly — no file path ever reaches its
+    internal cv2.imread(), so non-ASCII (Chinese) paths can't break it.
+    """
     boxes: list[dict[str, float]] = []
-    for bbox, text, conf in reader.readtext(str(img_path)):
+    for bbox, text, conf in reader.readtext(pixels):
         try:
             conf_f = float(conf)
         except (TypeError, ValueError):
@@ -287,6 +320,28 @@ def _to_output_box(
     return box
 
 
+def _ocr_one_frame(
+    reader: Any,
+    img_path: Path,
+    min_conf: float,
+    log: LogFn,
+    frame_no: int = 0,
+    total: int = 0,
+) -> list[dict[str, float]]:
+    """OCR a single frame; never raises.
+
+    One unreadable/corrupt frame must not kill the whole blur pass —
+    log it and move on (gap-bridging in _track_boxes covers the hole).
+    """
+    try:
+        pixels, img_w, img_h = _load_pixels(img_path)
+        return _detect_pixels(reader, pixels, img_w, img_h, min_conf)
+    except Exception as exc:
+        tag = f" {frame_no}/{total}" if total else ""
+        log(f"⚠️ OCR frame{tag} failed ({exc}); continuing with the rest.")
+        return []
+
+
 def detect_cjk_boxes(
     ffmpeg: str,
     video_path: str | Path,
@@ -316,7 +371,6 @@ def detect_cjk_boxes(
             return []
         log("🔍 Loading OCR model (first run downloads ~100-150 MB)…")
         reader = _easyocr_reader()
-        from PIL import Image
 
         boxes_by_time: list[tuple[float, list[dict[str, float]]]] = []
         total = len(frames)
@@ -325,9 +379,7 @@ def detect_cjk_boxes(
                 log("🔍 OCR stopped by user.")
                 return []
             t = i * interval_s
-            with Image.open(fp) as im:
-                img_w, img_h = im.size
-            boxes = _detect_frame(reader, fp, img_w, img_h, min_conf)
+            boxes = _ocr_one_frame(reader, fp, min_conf, log, i + 1, total)
             boxes_by_time.append((t, boxes))
             if (i + 1) % 20 == 0 or i + 1 == total:
                 log(f"🔍 OCR {i + 1}/{total} frames…")

@@ -2,8 +2,11 @@
 box merging, temporal tracking, gap bridging, and the time-ranged ffmpeg
 enable expression. Needs no network and no OCR models (reader is stubbed)."""
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 APP = Path(__file__).resolve().parents[1] / "app"
 if str(APP) not in sys.path:
@@ -11,8 +14,10 @@ if str(APP) not in sys.path:
 
 from cjk_blur import (
     _detect_frame,
+    _detect_pixels,
     _iou,
     _merge_boxes,
+    _ocr_one_frame,
     _to_output_box,
     _track_boxes,
     has_cjk,
@@ -27,13 +32,15 @@ def _b(x, y, w, h, **kw):
 
 
 class FakeReader:
-    """Stub EasyOCR reader: scripted detections per image path."""
+    """Stub EasyOCR reader: scripted detections; records what it received."""
 
-    def __init__(self, script):
-        self.script = script  # {basename: [(bbox4, text, conf), ...]}
+    def __init__(self, detections):
+        self.detections = detections  # [(bbox4, text, conf), ...]
+        self.received = []
 
-    def readtext(self, img_path):
-        return self.script.get(Path(img_path).name, [])
+    def readtext(self, img):
+        self.received.append(img)
+        return self.detections
 
 
 def _quad(x, y, w, h):
@@ -73,14 +80,13 @@ class TestMergeBoxes(unittest.TestCase):
 
 class TestDetectFrame(unittest.TestCase):
     def test_cjk_kept_english_dropped(self):
-        reader = FakeReader({
-            "frm_00001.jpg": [
-                (_quad(10, 10, 100, 30), "中文字幕", 0.9),
-                (_quad(200, 10, 100, 30), "hello", 0.9),
-                (_quad(10, 200, 100, 30), "你好", 0.1),  # below min_conf
-            ],
-        })
-        boxes = _detect_frame(reader, Path("frm_00001.jpg"), 960, 540, 0.35)
+        reader = FakeReader([
+            (_quad(10, 10, 100, 30), "中文字幕", 0.9),
+            (_quad(200, 10, 100, 30), "hello", 0.9),
+            (_quad(10, 200, 100, 30), "你好", 0.1),  # below min_conf
+        ])
+        pixels = np.zeros((540, 960, 3), dtype=np.uint8)
+        boxes = _detect_pixels(reader, pixels, 960, 540, 0.35)
         # high-conf CJK kept as normal; weak CJK kept flagged (extends only)
         self.assertEqual(len(boxes), 2)
         by_text = {b["text"]: b for b in boxes}
@@ -249,7 +255,7 @@ class TestStrongShapeWeakBoxes(unittest.TestCase):
         class R:
             def readtext(self, p):
                 return [(box, text, conf)]
-        return _detect_frame(R(), Path("f.jpg"), 960, 540, 0.35)
+        return _detect_pixels(R(), np.zeros((540, 960, 3), np.uint8), 960, 540, 0.35)
 
     def test_vertical_weak_box_can_start_track(self):
         boxes = self._detect(0.04, 0.40)  # tall-narrow: vertical text
@@ -290,7 +296,7 @@ class TestStrongShapeNoCjk(unittest.TestCase):
         class R:
             def readtext(self, p):
                 return [(box, text, conf)]
-        return _detect_frame(R(), Path("f.jpg"), 960, 540, 0.35)
+        return _detect_pixels(R(), np.zeros((540, 960, 3), np.uint8), 960, 540, 0.35)
 
     def test_vertical_no_cjk_kept_as_strong(self):
         # stylized vertical text: recognition fails entirely, shape saves it
@@ -310,7 +316,7 @@ class TestEdgeTouchRule(unittest.TestCase):
         class R:
             def readtext(self, p):
                 return [(box, text, conf)]
-        return _detect_frame(R(), Path("f.jpg"), 960, 540, 0.35)
+        return _detect_pixels(R(), np.zeros((540, 960, 3), np.uint8), 960, 540, 0.35)
 
     def test_top_edge_no_cjk_dropped(self):
         # tree branches touching the top edge: not trusted without text
@@ -322,3 +328,42 @@ class TestEdgeTouchRule(unittest.TestCase):
         boxes = self._detect_at(0.07, 0.12, 0.04, 0.40)
         self.assertEqual(len(boxes), 1)
         self.assertTrue(boxes[0]["ss"])
+
+
+class TestNonAsciiPath(unittest.TestCase):
+    """Regression: Windows + Chinese path must not kill the blur pass.
+
+    EasyOCR's internal cv2.imread() returns None for non-ASCII paths on
+    Windows (e.g. a job folder named after a Chinese video), which crashed
+    with "'NoneType' object has no attribute 'shape'" and skipped the
+    entire auto-blur pass. The reader must receive pixels, never a path.
+    """
+
+    def test_reader_never_gets_a_path(self):
+        from PIL import Image
+
+        with tempfile.TemporaryDirectory() as tmp:
+            img_path = Path(tmp) / "辰雪奔赴1-8超长版_acc6af97" / "frm_00001.jpg"
+            img_path.parent.mkdir(parents=True)
+            Image.new("RGB", (96, 54), (20, 20, 20)).save(img_path)
+            reader = FakeReader([(_quad(10, 10, 40, 12), "中文字", 0.9)])
+            boxes = _detect_frame(reader, img_path, 96, 54, 0.35)
+            self.assertEqual(len(reader.received), 1)
+            got = reader.received[0]
+            self.assertIsInstance(got, np.ndarray,
+                                  "EasyOCR must get pixels, not a file path")
+            self.assertEqual(got.shape, (54, 96, 3))
+            self.assertEqual(len(boxes), 1)
+            self.assertEqual(boxes[0]["text"], "中文字")
+
+    def test_one_bad_frame_does_not_abort(self):
+        class BoomReader:
+            def readtext(self, img):
+                raise RuntimeError("simulated OCR failure")
+
+        logs: list[str] = []
+        boxes = _ocr_one_frame(BoomReader(), Path("nope.jpg"), 0.35,
+                               logs.append, 2, 10)
+        self.assertEqual(boxes, [])
+        self.assertTrue(any("frame 2/10" in m for m in logs),
+                        f"expected a frame-tagged warning, got: {logs}")
