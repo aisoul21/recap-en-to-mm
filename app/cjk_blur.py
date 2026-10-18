@@ -102,6 +102,7 @@ def _union(a: dict[str, float], b: dict[str, float]) -> dict[str, float]:
         if k in a or k in b:
             out[k] = a.get(k, b.get(k))
     out["lc"] = bool(a.get("lc", False) and b.get("lc", False))
+    out["ss"] = bool(a.get("ss", False) or b.get("ss", False))
     return out
 
 
@@ -152,19 +153,16 @@ def _detect_frame(
 ) -> list[dict[str, float]]:
     """OCR one frame → merged CJK boxes in normalized (0..1) coordinates.
 
-    Boxes with min_conf > conf >= LOW_CONF are kept but flagged ("lc");
-    they may extend an existing track, never start a new one. This catches
-    correctly-located subtitle boxes whose recognition failed.
+    Boxes weaker than LOW_CONF are dropped — UNLESS their shape screams
+    "text": very large (disclaimers/titles) or tall-narrow (vertical text).
+    Weak boxes (conf < min_conf) without a strong shape are flagged ("lc"):
+    they may extend an existing nearby track but never start a new one.
     """
     boxes: list[dict[str, float]] = []
     for bbox, text, conf in reader.readtext(str(img_path)):
         try:
             conf_f = float(conf)
         except (TypeError, ValueError):
-            continue
-        if not has_cjk(text):
-            continue
-        if conf_f < min_conf and conf_f < LOW_CONF:
             continue
         xs = [float(p[0]) for p in bbox]
         ys = [float(p[1]) for p in bbox]
@@ -174,10 +172,22 @@ def _detect_frame(
         y1 = min(float(img_h), max(ys)) / img_h
         if x1 - x0 < 0.004 or y1 - y0 < 0.004:
             continue
+        w, h = x1 - x0, y1 - y0
+        strong_shape = (w * h > 0.03) or (h > 2.5 * w and h > 0.08)
+        # Strong-shape regions are kept even when recognition fails
+        # completely (stylized vertical text) — but only when the region
+        # does NOT bleed off a frame edge. Real overlays always have
+        # padding; branches/window-frames often touch the edge.
+        touches_edge = (x0 < 0.01 or y0 < 0.02 or x1 > 0.99 or y1 > 0.98)
+        if not has_cjk(text) and not (strong_shape and not touches_edge):
+            continue
+        if conf_f < LOW_CONF and not strong_shape:
+            continue
         boxes.append(
-            {"x": x0, "y": y0, "w": x1 - x0, "h": y1 - y0,
+            {"x": x0, "y": y0, "w": w, "h": h,
              "text": str(text), "conf": round(conf_f, 3),
-             "lc": conf_f < min_conf}
+             "lc": conf_f < min_conf and not strong_shape,
+             "ss": strong_shape}
         )
     return _merge_boxes(boxes)
 
@@ -208,10 +218,12 @@ def _track_boxes(
             if best is not None and best_iou >= match_iou:
                 best["box"] = _union(best["box"], b)
                 best["last"] = dict(b)
+                best["ss"] = best.get("ss", False) or b.get("ss", False)
                 best["t1"] = t
             elif not b.get("lc"):
                 tracks.append({"box": dict(b), "last": dict(b),
-                               "t0": t, "t1": t})
+                               "t0": t, "t1": t,
+                               "ss": b.get("ss", False)})
             # else: weak box with no nearby track — likely noise, drop it
     # Bridge gaps: same text zone that blinked for a few seconds.
     tracks.sort(key=lambda tr: tr["t0"])
@@ -230,7 +242,10 @@ def _track_boxes(
                     continue
             out.append(tr)
         tracks = out
-    return [tr for tr in tracks if tr["t1"] - tr["t0"] >= min_dur_s - 1e-9]
+    # Strong-shape tracks (big titles, vertical text) survive even from a
+    # single frame — brief name cards appear for ~2s and must not be lost.
+    return [tr for tr in tracks
+            if tr["t1"] - tr["t0"] >= min_dur_s - 1e-9 or tr.get("ss")]
 
 
 def _to_output_box(

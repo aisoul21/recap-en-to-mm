@@ -212,3 +212,88 @@ class TestLastBoxMatching(unittest.TestCase):
         tracks = _track_boxes(seq, 2.0, min_dur_s=1.0)
         self.assertEqual(len(tracks), 1)
         self.assertEqual(tracks[0]["t1"], 4.0)
+
+class TestStrongShapeWeakBoxes(unittest.TestCase):
+    def _detect(self, w, h, text="陈实", conf=0.02):
+        # fake easyocr readtext -> (bbox, text, conf); frame 960x540
+        px = lambda v, s: v * s
+        box = [[px(0.10, 960), px(0.10, 540)],
+               [px(0.10 + w, 960), px(0.10, 540)],
+               [px(0.10 + w, 960), px(0.10 + h, 540)],
+               [px(0.10, 960), px(0.10 + h, 540)]]
+        class R:
+            def readtext(self, p):
+                return [(box, text, conf)]
+        return _detect_frame(R(), Path("f.jpg"), 960, 540, 0.35)
+
+    def test_vertical_weak_box_can_start_track(self):
+        boxes = self._detect(0.04, 0.40)  # tall-narrow: vertical text
+        self.assertEqual(len(boxes), 1)
+        self.assertFalse(boxes[0]["lc"])
+        tracks = _track_boxes([(0.0, boxes), (2.0, boxes)], 2.0, min_dur_s=1.0)
+        self.assertEqual(len(tracks), 1)
+
+    def test_large_weak_box_can_start_track(self):
+        boxes = self._detect(0.45, 0.20, text="本剧为")  # large: disclaimer
+        self.assertEqual(len(boxes), 1)
+        self.assertFalse(boxes[0]["lc"])
+
+    def test_small_weak_box_stays_extend_only(self):
+        boxes = self._detect(0.10, 0.05)  # small, weak -> extend-only
+        self.assertEqual(len(boxes), 1)
+        self.assertTrue(boxes[0]["lc"])
+
+class TestSingleFrameStrongTrack(unittest.TestCase):
+    def test_brief_vertical_card_survives(self):
+        # a name card visible on a single sampled frame must not be dropped
+        b = {"x": 0.81, "y": 0.09, "w": 0.12, "h": 0.38, "text": "陈夏花",
+             "conf": 0.02, "lc": False, "ss": True}
+        tracks = _track_boxes([(44.0, [b])], 2.0, min_dur_s=1.0)
+        self.assertEqual(len(tracks), 1)
+        self.assertEqual(tracks[0]["t0"], 44.0)
+
+    def test_single_weak_normal_box_still_dropped(self):
+        b = {"x": 0.30, "y": 0.80, "w": 0.10, "h": 0.05, "text": "你好",
+             "conf": 0.40, "lc": False, "ss": False}
+        tracks = _track_boxes([(44.0, [b])], 2.0, min_dur_s=1.0)
+        self.assertEqual(tracks, [])
+
+class TestStrongShapeNoCjk(unittest.TestCase):
+    def _detect(self, w, h, text="...", conf=0.0):
+        box = [[96, 54], [96 + w * 960, 54],
+               [96 + w * 960, 54 + h * 540], [96, 54 + h * 540]]
+        class R:
+            def readtext(self, p):
+                return [(box, text, conf)]
+        return _detect_frame(R(), Path("f.jpg"), 960, 540, 0.35)
+
+    def test_vertical_no_cjk_kept_as_strong(self):
+        # stylized vertical text: recognition fails entirely, shape saves it
+        boxes = self._detect(0.04, 0.40, text="", conf=0.0)
+        self.assertEqual(len(boxes), 1)
+        self.assertFalse(boxes[0]["lc"])
+        self.assertTrue(boxes[0]["ss"])
+
+    def test_small_english_still_dropped(self):
+        boxes = self._detect(0.10, 0.05, text="hello", conf=0.9)
+        self.assertEqual(len(boxes), 0)
+
+class TestEdgeTouchRule(unittest.TestCase):
+    def _detect_at(self, x0n, y0n, w, h, text="", conf=0.0):
+        box = [[x0n * 960, y0n * 540], [(x0n + w) * 960, y0n * 540],
+               [(x0n + w) * 960, (y0n + h) * 540], [x0n * 960, (y0n + h) * 540]]
+        class R:
+            def readtext(self, p):
+                return [(box, text, conf)]
+        return _detect_frame(R(), Path("f.jpg"), 960, 540, 0.35)
+
+    def test_top_edge_no_cjk_dropped(self):
+        # tree branches touching the top edge: not trusted without text
+        boxes = self._detect_at(0.05, 0.000, 0.075, 0.30)
+        self.assertEqual(len(boxes), 0)
+
+    def test_padded_no_cjk_kept(self):
+        # same shape with padding from the edge: trusted as vertical text
+        boxes = self._detect_at(0.07, 0.12, 0.04, 0.40)
+        self.assertEqual(len(boxes), 1)
+        self.assertTrue(boxes[0]["ss"])
